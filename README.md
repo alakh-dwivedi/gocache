@@ -1,48 +1,132 @@
-# gocache
-It's an in memory key store
+# GoCache
 
-Distributed Replicated Key-Value Store (gocache)A high-availability, low-latency, memory-cached database cluster that manages object lifecycles and elects its own master leadership automatically.text                  [ Multi-Node Cluster Network ]
-                                 │
-           ┌─────────────────────┼─────────────────────┐
-           ▼                     ▼                     ▼
-    ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-    │ Node 1 (6379)│      │ Node 2 (6380)│      │ Node 3 (6381)│
-    │  [ Leader ]  │ ───► │ [ Follower ] │      │ [ Follower ] │
-    │ ── ── ── ──  │      │ ── ── ── ──  │      │ ── ── ── ──  │
-    │ Memory Map   │      │ Memory Map   │      │ Memory Map   │
-    │ TTL Janitor  │      │ TTL Janitor  │      │ TTL Janitor  │
-    └──────────────┘      └──────────────┘      └──────────────┘
-           ▲                     ▲                     ▲
-           └────────────── (Raft Heartbeats / Votes) ──┘
+GoCache is an in-memory key-value store written in Go. It provides a concurrent storage engine with optional key expiration, a TCP server, and a small RESP-style protocol implementation. The project is being developed in phases, from a single-node store toward a clustered service.
 
+## Features
 
-We will build a thread-safe memory store, wrap it in a custom text protocol server, and then introduce two more nodes to form a true cluster that automatically replicates data.text                  [ Cluster Network Engine ]
-                             │
-       ┌─────────────────────┼─────────────────────┐
-       ▼                     ▼                     ▼
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│  Node 1 (C#) │ ───► │  Node 2 (C#) │ ───► │  Node 3 (C#) │
-│ [Raft/Repl]  │ ◄─── │ [Raft/Repl]  │ ◄─── │ [Raft/Repl]  │
-└──────────────┘      └──────────────┘      └──────────────┘
-Use code with caution.Phase 1: The Core Engine & TTL ExpiryConcepts: ConcurrentDictionary, Read/Write Locking, Background Sweeper Threads.Goal: Build an in-memory key-value database that supports SET, GET, and keys that automatically delete themselves after a Time-To-Live (TTL) expires.
+- Thread-safe in-memory key-value storage
+- Optional time-to-live (TTL) for keys, with background cleanup
+- TCP server supporting a subset of RESP commands
+- Cluster and Raft-related components under development
 
-Phase 2: The RESP/Custom Network ProtocolConcepts: TcpListener, Async Sockets, Byte Array Parsing.Goal: Turn the database into a server. We can implement a simplified version of Redis's official network protocol (RESP) so you can literally use the official Redis CLI to connect to your database!
+## Architecture
 
-Phase 3: Cluster Discovery & Health PingsConcepts: Cluster Topology, Background Heartbeats, Connection State Machines.Goal: Spin up 3 different instances of your database container. Teach them to recognize each other's network addresses and continually ping one another to verify cluster health.
+The server accepts client commands over TCP, parses RESP-style requests, and dispatches each command to the appropriate handler. Reads access the in-memory store; writes pass through the cluster manager before being applied.
 
-Phase 4: Active Replication (Leader/Follower)Concepts: Replication Logs, Read-Only Slaves, State Synchronization.Goal: When you write a key to Node 1, it acts as the Leader and automatically broadcasts the change down to Node 2 and Node 3 across the internal cluster network.
+```mermaid
+flowchart LR
+	Client --> TCP[TCP server]
+	TCP --> Parser[RESP-style parser]
+	Parser --> Dispatch[Command dispatcher]
+	Dispatch -->|PING| Pong[PONG response]
+	Dispatch -->|GET| Store[(In-memory store)]
+	Store --> Value[Value response]
+	Dispatch -->|SET| Leader{This node is leader?}
+	Leader -->|No| Forward[Forward to known leader]
+	Leader -->|Yes| Commit[Append and replicate log entry]
+	Commit --> Apply[Apply committed entry]
+	Apply --> Store
+	Forward --> Result[Command response]
+	Commit --> Result
+```
 
-Phase 5: Raft Elections & Consensus (The Final Level)Concepts: Term Numbers, Quorum Voting, Split-Brain Prevention.Goal: If you manually kill Node 1 (The Leader), Node 2 and Node 3 will automatically detect the failure, hold an emergency election, vote on a new Leader, and keep the database cluster running smoothly without human intervention.
+## Cluster Topology
 
-Commands to run
- go run ./cmd/server/ -id=node-3 -addr="127.0.0.1:6381" -peers="127.0.0.1:6379,127.0.0.1:6380,127.0.0.1:6381"
+The diagrams below show the intended three-node cluster and replication layout. They are conceptual: cluster discovery, replication, and elections are experimental, and node roles and failover behavior are still under development.
 
- To SET the cache
- SET <key> <Value> EX <ttl>
+### Multi-Node Cluster Network
 
- To GET the value of key in cache
- GET <key>
+```text
+				     [ Multi-Node Cluster Network ]
+							│
+		     ┌─────────────────────────────┼─────────────────────────────┐
+		     ▼                             ▼                             ▼
+	     ┌──────────────┐              ┌──────────────┐              ┌──────────────┐
+	     │ Node 1 (6379)│              │ Node 2 (6380)│              │ Node 3 (6381)│
+	     │  [ Leader ]  │ ───────────► │ [ Follower ] │              │ [ Follower ] │
+	     │ ──────────── │              │ ──────────── │              │ ──────────── │
+	     │ Memory Map   │              │ Memory Map   │              │ Memory Map   │
+	     │ TTL Janitor  │              │ TTL Janitor  │              │ TTL Janitor  │
+	     └──────────────┘              └──────────────┘              └──────────────┘
+		     ▲                             ▲                             ▲
+		     └────────────── (Raft Heartbeats / Votes) ────────────────┘
+```
 
+Each node combines the thread-safe in-memory store with the TCP command server. The project is evolving from a standalone store toward a replicated cluster.
 
- To DELETE the value of cache
- DEL <key>
+### Cluster Network Engine
+
+```text
+	┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+	│  Node 1 (Go) │ ────► │  Node 2 (Go) │ ────► │  Node 3 (Go) │
+	│ [Raft/Repl]  │ ◄──── │ [Raft/Repl]  │ ◄──── │ [Raft/Repl]  │
+	└──────────────┘       └──────────────┘       └──────────────┘
+```
+
+## Project Structure
+
+```text
+.
+├── cmd/
+│   └── server/
+│       ├── main.go          # Server entry point
+│       └── client/
+│           └── client.go    # Small RESP client for local testing
+├── internal/
+│   ├── protocol/            # RESP-style command parsing
+│   ├── server/              # TCP server and cluster logic
+│   └── store/               # In-memory storage and TTL cleanup
+├── go.mod
+└── README.md
+```
+
+## Run Locally
+
+### Prerequisites
+
+- Go 1.25 or later
+
+### Start a single-node server
+
+From the repository root, run:
+
+```powershell
+go run ./cmd/server -id=node-1 -addr=127.0.0.1:6379 -peers=127.0.0.1:6379
+```
+
+Keep this terminal open. The peer list is intentionally set to this node alone so the local server can form a one-node quorum; the default peer list is intended for a three-node setup.
+
+### Send commands
+
+Open a second terminal at the repository root. The included client accepts a port, a command, and its arguments:
+
+```powershell
+go run ./cmd/server/client 6379 PING
+go run ./cmd/server/client 6379 SET greeting "hello world"
+go run ./cmd/server/client 6379 GET greeting
+go run ./cmd/server/client 6379 SET temporary "expires soon" EX 10
+go run ./cmd/server/client 6379 DEL greeting
+```
+
+The client prints the server's RESP response. `EX` takes a TTL in seconds. Keys without a TTL remain until deleted or the server stops; the store is in memory and does not persist its values across restarts.
+
+## Supported Commands
+
+| Command | Usage | Description |
+| --- | --- | --- |
+| `PING` | `PING` | Check that the server responds. |
+| `SET` | `SET <key> <value> [EX <seconds>]` | Store a value, optionally with a TTL. |
+| `GET` | `GET <key>` | Read a value. |
+| `DEL` | `DEL <key>` | Delete a key. |
+
+The protocol supports RESP arrays of bulk strings and simple text commands. It is not a complete Redis/RESP implementation.
+
+## Development Phases
+
+1. **Core store and TTL expiry:** Thread-safe in-memory storage and background expiration cleanup.
+2. **TCP server and protocol:** Accept client connections and parse RESP-style commands.
+3. **Cluster discovery and health:** Configure node identities and peer addresses, and track cluster health.
+4. **Replication:** Replicate writes between a leader and followers.
+5. **Raft elections and consensus:** Elect a leader and coordinate committed writes.
+
+The clustering, replication, and consensus work is experimental and still evolving. The single-node instructions above are the recommended way to try the current server locally.
